@@ -947,7 +947,17 @@ Item {
                     selectByMouse: true
                     activeFocusOnTab: true
                     KeyNavigation.tab: keyGoField
-                    cursorDelegate: Rectangle { width: 2; height: keyField.cursorRectangle.height; color: Color.accent }
+                    cursorDelegate: Rectangle {
+                      width: 2; height: keyField.cursorRectangle.height; color: Color.accent
+                      SequentialAnimation on opacity {
+                        running: keyField.activeFocus
+                        loops: Animation.Infinite
+                        NumberAnimation { to: 1; duration: 1 }
+                        PauseAnimation { duration: 550 }
+                        NumberAnimation { to: 0; duration: 1 }
+                        PauseAnimation { duration: 550 }
+                      }
+                    }
                     Text { anchors.verticalCenter: parent.verticalCenter; visible: keyField.text.length === 0; text: "sk-or-…"; color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.body }
                     Keys.onReturnPressed: { if (keyField.text.length > 0) root.storeKey(keyField.text); root.closeSettings() }
                     Keys.onEnterPressed: { if (keyField.text.length > 0) root.storeKey(keyField.text); root.closeSettings() }
@@ -978,7 +988,17 @@ Item {
                     selectByMouse: true
                     activeFocusOnTab: true
                     KeyNavigation.tab: cmField
-                    cursorDelegate: Rectangle { width: 2; height: keyGoField.cursorRectangle.height; color: Color.accent }
+                    cursorDelegate: Rectangle {
+                      width: 2; height: keyGoField.cursorRectangle.height; color: Color.accent
+                      SequentialAnimation on opacity {
+                        running: keyGoField.activeFocus
+                        loops: Animation.Infinite
+                        NumberAnimation { to: 1; duration: 1 }
+                        PauseAnimation { duration: 550 }
+                        NumberAnimation { to: 0; duration: 1 }
+                        PauseAnimation { duration: 550 }
+                      }
+                    }
                     Text { anchors.verticalCenter: parent.verticalCenter; visible: keyGoField.text.length === 0; text: "paste from opencode /connect…"; color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.body }
                     Keys.onReturnPressed: { if (keyGoField.text.length > 0) root.storeGoKey(keyGoField.text); root.closeSettings() }
                     Keys.onEnterPressed: { if (keyGoField.text.length > 0) root.storeGoKey(keyGoField.text); root.closeSettings() }
@@ -1029,7 +1049,17 @@ Item {
                     selectByMouse: true
                     activeFocusOnTab: true
                     KeyNavigation.tab: sysEdit
-                    cursorDelegate: Rectangle { width: 2; height: cmField.cursorRectangle.height; color: Color.accent }
+                    cursorDelegate: Rectangle {
+                      width: 2; height: cmField.cursorRectangle.height; color: Color.accent
+                      SequentialAnimation on opacity {
+                        running: cmField.activeFocus
+                        loops: Animation.Infinite
+                        NumberAnimation { to: 1; duration: 1 }
+                        PauseAnimation { duration: 550 }
+                        NumberAnimation { to: 0; duration: 1 }
+                        PauseAnimation { duration: 550 }
+                      }
+                    }
                     Keys.onReturnPressed: { if (root.addCustomModel(cmField.text)) cmField.text = "" }
                     Keys.onEnterPressed: { if (root.addCustomModel(cmField.text)) cmField.text = "" }
                     Keys.onEscapePressed: root.closeSettings()
@@ -1170,7 +1200,17 @@ Item {
                       wrapMode: TextEdit.Wrap; selectByMouse: true
                       selectionColor: Util.alpha(Color.accent, 0.35)
                       activeFocusOnTab: true
-                      cursorDelegate: Rectangle { width: 2; height: sysEdit.cursorRectangle.height; color: Color.accent }
+                      cursorDelegate: Rectangle {
+                        width: 2; height: sysEdit.cursorRectangle.height; color: Color.accent
+                        SequentialAnimation on opacity {
+                          running: sysEdit.activeFocus
+                          loops: Animation.Infinite
+                          NumberAnimation { to: 1; duration: 1 }
+                          PauseAnimation { duration: 550 }
+                          NumberAnimation { to: 0; duration: 1 }
+                          PauseAnimation { duration: 550 }
+                        }
+                      }
                       Keys.onPressed: function (event) {
                         if ((event.modifiers & Qt.ControlModifier) && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) { root.closeSettings(); event.accepted = true }
                         else if (event.key === Qt.Key_Escape) { root.closeSettings(); event.accepted = true }
