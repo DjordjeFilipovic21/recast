@@ -106,7 +106,12 @@ Item {
   property string effort: "default"
   property bool autoCopy: true
   property bool renderMarkdown: true     // light markdown in answers (toggle in settings)
-  property bool webSearch: false         // web plugin: OpenRouter always, Go chat endpoint (trial)
+  property bool webSearch: false         // OpenRouter: web plugin; OpenCode Go: Tavily client search
+  property string tavilyApiKey: String(Quickshell.env("TAVILY_API_KEY") || "")
+  property bool searching: false         // Tavily lookup in flight (Go + webSearch)
+  property string searchBuf: ""          // raw Tavily /search response accumulator
+  property string searchError: ""        // last Tavily failure, shown in Settings
+  property bool searchCtxAppended: false // last message is an injected search-context block
   property string userSystemPrompt: ""   // empty = use the built-in transformPrompt
   property string location: ""           // for the {location} placeholder (Omarchy weather setting)
   readonly property string configPath: Quickshell.env("HOME") + "/.config/recast/config.json"
@@ -240,15 +245,20 @@ Item {
     root.settingsOpen = false
     root.sessionId = ""
     root.streamKind = "chat"
+    root.searching = false
+    root.searchCtxAppended = false
     root.opened = true
     if (!root.apiKey) keyProc.running = true
     if (!root.goApiKey) keyGoProc.running = true
     else root.maybeFetchGoModels()
+    if (!root.tavilyApiKey) keyTavilyProc.running = true
     Qt.callLater(function () { input.forceActiveFocus() })
   }
   function close() {
     root.opened = false
     if (streamProc.running) streamProc.running = false
+    if (searchProc.running) searchProc.running = false
+    root.searching = false
     input.text = ""
   }
   function refresh() { return "ok" }
@@ -268,6 +278,10 @@ Item {
     }
     if (root.provider === "opencode-go" && (root.model === "" || root.allModels.length === 0)) {
       root.errorText = "No OpenCode Go model loaded. Open Settings → Refresh models."
+      return
+    }
+    if (root.provider === "opencode-go" && root.webSearch && !root.tavilyApiKey) {
+      root.errorText = "Web search is on but no Tavily key. Set TAVILY_API_KEY or paste it in Settings → Web search."
       return
     }
 
@@ -301,6 +315,9 @@ Item {
     root.actionFocus = -1
     root.busy = true
     root.streaming = false
+    // Go has no server-side search: Recast queries Tavily itself, then streams with
+    // the results injected as context. OpenRouter keeps using its web plugin.
+    if (root.provider === "opencode-go" && root.webSearch) { root.runTavilySearch(instruction); return }
     startStream()
   }
 
@@ -360,10 +377,9 @@ Item {
       body = JSON.stringify({ model: bare, input: inp, stream: true })
       streamProc.command = base.concat(["-d", body])
     } else {
-      // chat/completions (OpenAI-compatible): OpenRouter web plugin shape, trial on Go
-      var cp = { model: bare, messages: root.messages, stream: true }
-      if (root.webSearch) cp.plugins = [{ id: "web", max_results: 5 }]
-      body = JSON.stringify(cp)
+      // chat/completions (OpenAI-compatible). Go silently ignores OpenRouter's web
+      // plugin — search context is injected client-side via Tavily before this runs.
+      body = JSON.stringify({ model: bare, messages: root.messages, stream: true })
       streamProc.command = base.concat(["-d", body])
     }
     streamProc.running = true
@@ -424,8 +440,13 @@ Item {
       var msg = root.errorText !== "" ? root.errorText
         : ((exitCode && exitCode !== 0) ? "Request failed (curl exit " + exitCode + ")" : "No response from the model.")
       // drop the failed user turn from the API history and prefill the input so a retry is clean
-      if (root.messages.length > 0 && root.messages[root.messages.length - 1].role === "user")
+      // (plus the injected Tavily search-context block, when one was used)
+      var drop = root.searchCtxAppended ? 2 : 1
+      while (drop > 0 && root.messages.length > 0 && root.messages[root.messages.length - 1].role === "user") {
         root.messages = root.messages.slice(0, root.messages.length - 1)
+        drop--
+      }
+      root.searchCtxAppended = false
       root.history = root.history.concat([{ role: "assistant", text: msg, isError: true }])
       root.errorText = ""
       input.text = root.pendingUser
@@ -451,10 +472,16 @@ Item {
       root.history = root.history.slice(0, root.history.length - 1)
     root.lastAnswer = ""
     root.answer = ""
+    root.errorText = ""
     root.copiedHint = ""
     root.actionFocus = -1
+    if (root.searchCtxAppended && root.messages.length > 0 && root.messages[root.messages.length - 1].role === "user") {
+      root.messages = root.messages.slice(0, root.messages.length - 1)   // drop stale search context; a fresh one is fetched below
+      root.searchCtxAppended = false
+    }
     root.busy = true
     root.streaming = false
+    if (root.provider === "opencode-go" && root.webSearch && root.tavilyApiKey) { root.runTavilySearch(root.pendingUser); return }
     startStream()
   }
   function insertIntoSource() {
@@ -555,10 +582,12 @@ Item {
   }
   function newConversation() {
     if (streamProc.running) streamProc.running = false
+    if (searchProc.running) searchProc.running = false
     root.messages = []; root.history = []
     root.answer = ""; root.errorText = ""; root.lastAnswer = ""; root.copiedHint = ""
     root.pendingUser = ""; root.actionFocus = -1
-    root.busy = false; root.streaming = false
+    root.busy = false; root.streaming = false; root.searching = false
+    root.searchCtxAppended = false
     root.sessionId = ""
     input.text = ""
     Qt.callLater(function () { input.forceActiveFocus() })
@@ -752,6 +781,61 @@ Item {
     if (root.goModels.length > 0) return root.goModels.length + " models available."
     return "Model list not loaded yet."
   }
+  // ---- Tavily client search (OpenCode Go web grounding) -------------------------------
+  // Recast queries Tavily itself, then injects the results as one extra user message.
+  // Works with every Go endpoint family since it's just prompt context. On search
+  // failure we still stream — the model just answers from its own knowledge.
+  function runTavilySearch(query) {
+    root.searching = true
+    root.searchError = ""
+    root.searchBuf = ""
+    var body = JSON.stringify({
+      query: query, search_depth: "basic", max_results: 5,
+      chunks_per_source: 2, include_answer: true
+    })
+    searchProc.command = ["curl", "-s", "-m", "30", "-X", "POST", "https://api.tavily.com/search",
+      "-H", "Authorization: Bearer " + root.tavilyApiKey,
+      "-H", "Content-Type: application/json",
+      "--user-agent", "recast/0.2",
+      "-d", body]
+    searchProc.running = true
+  }
+  function onSearchDone(exitCode) {
+    root.searching = false
+    if (exitCode === 0) {
+      try {
+        var ctx = root.formatSearchContext(JSON.parse(root.searchBuf || "{}"))
+        if (ctx !== "") {
+          root.messages = root.messages.concat([{ role: "user", content: ctx }])
+          root.searchCtxAppended = true
+          startStream()
+          return
+        }
+        root.searchError = "No usable results."
+      } catch (e) { root.searchError = "Bad search response." }
+    } else {
+      root.searchError = "Search failed (curl exit " + exitCode + ")."
+    }
+    startStream()   // graceful: answer from model knowledge when search fails
+  }
+  function formatSearchContext(d) {
+    if (!d || !Array.isArray(d.results) || d.results.length === 0) return ""
+    var out = "Web search results (use these to ground your answer; cite sources with markdown links):\n"
+    for (var i = 0; i < d.results.length; i++) {
+      var r = d.results[i]
+      var content = String(r.content || "").replace(/^\s+|\s+$/g, "")
+      if (content.length > 600) content = content.substring(0, 600) + "…"
+      out += "\n[" + (i + 1) + "] " + String(r.title || r.url || "source")
+        + "\nURL: " + String(r.url || "") + "\n" + content + "\n"
+    }
+    if (d.answer) out += "\nSearch summary: " + String(d.answer) + "\n"
+    return out
+  }
+  function tavilyStatus() {
+    if (root.searching) return "Searching…"
+    if (root.searchError !== "") return root.searchError
+    return (root.tavilyApiKey !== "" ? "A key is set. " : "") + "5 results per search, injected as context for Go models."
+  }
   function saveConfig() {
     cfgFile.setText(JSON.stringify({
       provider: root.provider, model: root.model, effort: root.effort, autoCopy: root.autoCopy,
@@ -770,7 +854,7 @@ Item {
   function closeSettings() {
     root.userSystemPrompt = (sysEdit.text === root.transformPrompt) ? "" : sysEdit.text
     saveConfig()
-    root.settingsOpen = false; keyField.text = ""; keyGoField.text = ""
+    root.settingsOpen = false; keyField.text = ""; keyGoField.text = ""; tavilyField.text = ""
     Qt.callLater(function () { input.forceActiveFocus() })
   }
   function toggleAutoCopy() { root.autoCopy = !root.autoCopy; saveConfig() }
@@ -826,6 +910,14 @@ Item {
     } }
   }
   Process {
+    id: keyTavilyProc
+    command: ["bash", "-c",
+      "secret-tool lookup service tavily app recast 2>/dev/null"]
+    stdout: SplitParser { onRead: function (data) {
+      if (!root.tavilyApiKey) root.tavilyApiKey = data.replace(/^\s+|\s+$/g, "")
+    } }
+  }
+  Process {
     id: goModelsProc
     stdout: SplitParser { onRead: function (data) { root.goModelsBuf += data + "\n" } }
     onExited: function (exitCode, exitStatus) { root.onGoModelsDone(exitCode) }
@@ -845,6 +937,19 @@ Item {
       "--", k]
     keyStoreProc.running = true
     root.maybeFetchGoModels()
+  }
+  function storeTavilyKey(k) {
+    root.tavilyApiKey = k
+    root.searchError = ""
+    keyStoreProc.command = ["bash", "-c",
+      "printf %s \"$1\" | secret-tool store --label='Recast (Tavily)' service tavily app recast",
+      "--", k]
+    keyStoreProc.running = true
+  }
+  Process {
+    id: searchProc
+    stdout: SplitParser { onRead: function (data) { root.searchBuf += data + "\n" } }
+    onExited: function (exitCode, exitStatus) { root.onSearchDone(exitCode) }
   }
   Process {
     id: streamProc
@@ -1048,7 +1153,7 @@ Item {
                     color: Color.menu.text; font.family: Style.font.family; font.pixelSize: Style.font.body; clip: true
                     selectByMouse: true
                     activeFocusOnTab: true
-                    KeyNavigation.tab: sysEdit
+                    KeyNavigation.tab: tavilyField
                     cursorDelegate: Rectangle {
                       width: 2; height: cmField.cursorRectangle.height; color: Color.accent
                       SequentialAnimation on opacity {
@@ -1152,7 +1257,7 @@ Item {
               Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: Util.alpha(Color.menu.border, 0.4) }
             }
 
-            // web-search toggle (OpenRouter web plugin; also sent to the Go chat endpoint)
+            // web-search toggle (OpenRouter web plugin; Tavily client search for Go)
             Item {
               width: parent.width; height: webCol.implicitHeight + root.padV * 2
               Column {
@@ -1168,9 +1273,50 @@ Item {
                   }
                   Text { anchors.verticalCenter: parent.verticalCenter; text: "Search the web before answering"; color: Color.menu.text; font.family: Style.font.family; font.pixelSize: Style.font.body }
                 }
-                Text { width: parent.width; wrapMode: Text.WordWrap; text: "OpenRouter: web plugin (~$0.007/search + tokens). Go: sent to chat models only; if the gateway rejects it, turn this off."; color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall }
+                Text { width: parent.width; wrapMode: Text.WordWrap; text: "OpenRouter: built-in web plugin (~$0.007/search + tokens). OpenCode Go: Tavily search, key below."; color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall }
               }
               MouseArea { anchors.fill: parent; onClicked: root.toggleWebSearch() }
+              Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: Util.alpha(Color.menu.border, 0.4) }
+            }
+
+            // Tavily key (client-side web search for OpenCode Go models)
+            Item {
+              width: parent.width; height: tavilyCol.implicitHeight + root.padV * 2
+              Column {
+                id: tavilyCol
+                x: root.padH; y: root.padV; width: parent.width - root.padH * 2; spacing: 8
+                Text { text: "Tavily API key (Go web search)"; color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall }
+                Rectangle {
+                  width: parent.width; height: Style.font.body + 18; color: "transparent"
+                  border.color: tavilyField.activeFocus ? Color.menu.selectedText : Util.alpha(Color.menu.border, 0.5); border.width: 1
+                  MouseArea { anchors.fill: parent; onPressed: function () { tavilyField.forceActiveFocus() } }
+                  TextInput {
+                    id: tavilyField
+                    anchors.fill: parent; anchors.leftMargin: 10; anchors.rightMargin: 10
+                    verticalAlignment: TextInput.AlignVCenter; echoMode: TextInput.Password
+                    color: Color.menu.text; font.family: Style.font.family; font.pixelSize: Style.font.body; clip: true
+                    selectByMouse: true
+                    activeFocusOnTab: true
+                    KeyNavigation.tab: sysEdit
+                    cursorDelegate: Rectangle {
+                      width: 2; height: tavilyField.cursorRectangle.height; color: Color.accent
+                      SequentialAnimation on opacity {
+                        running: tavilyField.activeFocus
+                        loops: Animation.Infinite
+                        NumberAnimation { to: 1; duration: 1 }
+                        PauseAnimation { duration: 550 }
+                        NumberAnimation { to: 0; duration: 1 }
+                        PauseAnimation { duration: 550 }
+                      }
+                    }
+                    Text { anchors.verticalCenter: parent.verticalCenter; visible: tavilyField.text.length === 0; text: "tvly-…"; color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.body }
+                    Keys.onReturnPressed: { if (tavilyField.text.length > 0) root.storeTavilyKey(tavilyField.text); root.closeSettings() }
+                    Keys.onEnterPressed: { if (tavilyField.text.length > 0) root.storeTavilyKey(tavilyField.text); root.closeSettings() }
+                    Keys.onEscapePressed: root.closeSettings()
+                  }
+                }
+                Text { width: parent.width; text: root.tavilyStatus(); color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+              }
               Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: Util.alpha(Color.menu.border, 0.4) }
             }
 
@@ -1431,7 +1577,7 @@ Item {
               Text { text: root.modelLabel(root.model); color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall }
               Text {
                 width: parent.width
-                text: root.streaming ? root.mdSafe(root.answer, root.renderMarkdown) : root.spinnerFrames.charAt(root.spinIndex)
+                text: root.streaming ? root.mdSafe(root.answer, root.renderMarkdown) : (root.searching ? "Searching the web… " + root.spinnerFrames.charAt(root.spinIndex) : root.spinnerFrames.charAt(root.spinIndex))
                 color: root.streaming ? Color.menu.text : Color.accent   // themed spinner glyph
                 font.family: Style.font.family; font.pixelSize: Style.font.body
                 wrapMode: Text.WordWrap

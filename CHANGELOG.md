@@ -14,7 +14,12 @@ All notable changes to Recast are documented here. This project follows
   `x-opencode-session` header.
 - Go key resolution: opencode's `auth.json` (`/connect`), `OPENCODE_GO_API_KEY` /
   `OPENCODE_API_KEY`, or the system keyring (`service opencode-go, app recast`).
-- Web search toggle: OpenRouter `web` plugin for any model; also sent to Go chat models (trial).
+- Web search toggle: OpenRouter `web` plugin for any model.
+- Tavily client search for OpenCode Go (replaces the earlier `plugins` trial the gateway
+  silently ignored): Recast queries Tavily itself and injects the top 5
+  results as context (works with every Go endpoint family). New Settings field for the
+  Tavily key (`TAVILY_API_KEY` env or keyring `service tavily, app recast`), "Searching
+  the web…" indicator, graceful fallback to model knowledge when search fails.
 - Settings focus fixes: explicit Tab order across all fields (wraps from the system
   prompt back to the first key field), click-to-focus backup under each field, and
   mouse text selection in key/model fields.

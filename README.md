@@ -59,6 +59,8 @@ in the system keyring (never on disk). Two providers are supported — pick one 
 - **OpenRouter** — `OPENROUTER_API_KEY` env var or the Settings key field.
 - **OpenCode Go** (subscription via opencode's `/connect`) — picked up automatically from
   `~/.local/share/opencode/auth.json`, or set `OPENCODE_GO_API_KEY`, or paste it in Settings.
+- **Tavily** (web search for Go models) — set `TAVILY_API_KEY` or paste the key in Settings →
+  Web search. Get a free key at [tavily.com](https://tavily.com) (~1.000 pretraga/mesec free).
 
 Dependencies (all in Omarchy's base): `curl`, `jq`, `wl-clipboard`, `libsecret` (`secret-tool`),
 plus `hyprctl` and the `omarchy-shell`. Location context uses `omarchy-weather-location` if present.
@@ -69,7 +71,8 @@ plus `hyprctl` and the `omarchy-shell`. Location context uses `omarchy-weather-l
 2. `omarchy plugin remove io.github.tnep4.recast`
 3. Optional cleanup: `rm -rf ~/.config/recast` (settings) and
    `secret-tool clear service openrouter app recast` (the stored OpenRouter key) /
-   `secret-tool clear service opencode-go app recast` (the stored Go key).
+   `secret-tool clear service opencode-go app recast` (the stored Go key) /
+   `secret-tool clear service tavily app recast` (the stored Tavily key).
 
 ## Using it
 
@@ -81,8 +84,9 @@ plus `hyprctl` and the `omarchy-shell`. Location context uses `omarchy-weather-l
 - The top bar has a **provider** picker (OpenRouter / OpenCode Go), a **model** picker and a
   **reasoning-effort** picker (OpenRouter only).
 - **Web search** (Settings toggle): OpenRouter's `web` plugin grounds any model with fresh
-  results (~$0.007/search + tokens, citations arrive as links). Also sent to OpenCode Go chat
-  models on a trial basis — if the gateway rejects it, turn it off for Go.
+  results (~$0.007/search + tokens, citations arrive as links). For OpenCode Go, Recast
+  queries [Tavily](https://tavily.com) itself (free tier) and injects the top 5 results as
+  context — works with every Go model, citations arrive as markdown links.
 
 ### Dynamic context
 
@@ -123,7 +127,9 @@ Nothing is hardcoded: the model list is fetched from `https://opencode.ai/zen/go
 Settings to pick up newly added models. Go routes models to three APIs automatically —
 `chat/completions` (Kimi, GLM, DeepSeek, …), `messages` (MiniMax, Qwen), `responses` (Grok, Luna,
 Muse Spark) — and sends the `x-opencode-session` header Go asks for. Extra ids can be added under
-**Custom models** while the Go provider is active.
+**Custom models** while the Go provider is active. Web search for Go runs through Tavily:
+turn on **Search the web before answering** and set the Tavily key — Recast searches first
+(shows "Searching the web…"), then streams the answer grounded in the top 5 results.
 
 The effort picker maps to OpenRouter's `reasoning.effort` and is sent only when it isn't *Default*
 and the model supports reasoning; it's hidden for models that don't. Model and effort persist to
