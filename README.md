@@ -103,6 +103,7 @@ filled in each time you send:
 | `Enter` | Send |
 | `Ctrl+M` / `Ctrl+E` / `Ctrl+P` | Open the model / effort / provider picker (↑/↓ to move, `Enter` to pick) |
 | `Ctrl+,` | Settings (API keys) |
+| `Tab` | Move between Settings fields |
 | `Esc` | Close (a picker/settings first, then the panel) |
 
 ## Models & effort

@@ -936,11 +936,17 @@ Item {
                 Rectangle {
                   width: parent.width; height: Style.font.body + 18; color: "transparent"
                   border.color: keyField.activeFocus ? Color.menu.selectedText : Util.alpha(Color.menu.border, 0.5); border.width: 1
+                  // backup focus: if the TextInput ever ignores the press, this still focuses it
+                  // (declared first = below the TextInput, so a working TextInput keeps priority)
+                  MouseArea { anchors.fill: parent; onPressed: function () { keyField.forceActiveFocus() } }
                   TextInput {
                     id: keyField
                     anchors.fill: parent; anchors.leftMargin: 10; anchors.rightMargin: 10
                     verticalAlignment: TextInput.AlignVCenter; echoMode: TextInput.Password
                     color: Color.menu.text; font.family: Style.font.family; font.pixelSize: Style.font.body; clip: true
+                    selectByMouse: true
+                    activeFocusOnTab: true
+                    KeyNavigation.tab: keyGoField
                     cursorDelegate: Rectangle { width: 2; height: keyField.cursorRectangle.height; color: Color.accent }
                     Text { anchors.verticalCenter: parent.verticalCenter; visible: keyField.text.length === 0; text: "sk-or-…"; color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.body }
                     Keys.onReturnPressed: { if (keyField.text.length > 0) root.storeKey(keyField.text); root.closeSettings() }
@@ -963,11 +969,15 @@ Item {
                 Rectangle {
                   width: parent.width; height: Style.font.body + 18; color: "transparent"
                   border.color: keyGoField.activeFocus ? Color.menu.selectedText : Util.alpha(Color.menu.border, 0.5); border.width: 1
+                  MouseArea { anchors.fill: parent; onPressed: function () { keyGoField.forceActiveFocus() } }
                   TextInput {
                     id: keyGoField
                     anchors.fill: parent; anchors.leftMargin: 10; anchors.rightMargin: 10
                     verticalAlignment: TextInput.AlignVCenter; echoMode: TextInput.Password
                     color: Color.menu.text; font.family: Style.font.family; font.pixelSize: Style.font.body; clip: true
+                    selectByMouse: true
+                    activeFocusOnTab: true
+                    KeyNavigation.tab: cmField
                     cursorDelegate: Rectangle { width: 2; height: keyGoField.cursorRectangle.height; color: Color.accent }
                     Text { anchors.verticalCenter: parent.verticalCenter; visible: keyGoField.text.length === 0; text: "paste from opencode /connect…"; color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.body }
                     Keys.onReturnPressed: { if (keyGoField.text.length > 0) root.storeGoKey(keyGoField.text); root.closeSettings() }
@@ -1010,11 +1020,15 @@ Item {
                 Rectangle {
                   width: parent.width; height: Style.font.body + 18; color: "transparent"
                   border.color: cmField.activeFocus ? Color.menu.selectedText : Util.alpha(Color.menu.border, 0.5); border.width: 1
+                  MouseArea { anchors.fill: parent; onPressed: function () { cmField.forceActiveFocus() } }
                   TextInput {
                     id: cmField
                     anchors.fill: parent; anchors.leftMargin: 10; anchors.rightMargin: 10
                     verticalAlignment: TextInput.AlignVCenter
                     color: Color.menu.text; font.family: Style.font.family; font.pixelSize: Style.font.body; clip: true
+                    selectByMouse: true
+                    activeFocusOnTab: true
+                    KeyNavigation.tab: sysEdit
                     cursorDelegate: Rectangle { width: 2; height: cmField.cursorRectangle.height; color: Color.accent }
                     Keys.onReturnPressed: { if (root.addCustomModel(cmField.text)) cmField.text = "" }
                     Keys.onEnterPressed: { if (root.addCustomModel(cmField.text)) cmField.text = "" }
@@ -1155,10 +1169,12 @@ Item {
                       color: Color.menu.text; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall
                       wrapMode: TextEdit.Wrap; selectByMouse: true
                       selectionColor: Util.alpha(Color.accent, 0.35)
+                      activeFocusOnTab: true
                       cursorDelegate: Rectangle { width: 2; height: sysEdit.cursorRectangle.height; color: Color.accent }
                       Keys.onPressed: function (event) {
                         if ((event.modifiers & Qt.ControlModifier) && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)) { root.closeSettings(); event.accepted = true }
                         else if (event.key === Qt.Key_Escape) { root.closeSettings(); event.accepted = true }
+                        else if (event.key === Qt.Key_Tab && !(event.modifiers & Qt.ShiftModifier)) { keyField.forceActiveFocus(); event.accepted = true }
                       }
                     }
                   }

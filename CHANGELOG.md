@@ -15,6 +15,9 @@ All notable changes to Recast are documented here. This project follows
 - Go key resolution: opencode's `auth.json` (`/connect`), `OPENCODE_GO_API_KEY` /
   `OPENCODE_API_KEY`, or the system keyring (`service opencode-go, app recast`).
 - Web search toggle: OpenRouter `web` plugin for any model; also sent to Go chat models (trial).
+- Settings focus fixes: explicit Tab order across all fields (wraps from the system
+  prompt back to the first key field), click-to-focus backup under each field, and
+  mouse text selection in key/model fields.
 
 ## v0.1.0 - 2026-09-07
 
