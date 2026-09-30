@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "author": "nictouron",
   "license": "MIT",
-  "description": "Transform selected text or chat with an LLM (OpenRouter), streamed, with follow-ups.",
+  "description": "Transform selected text or chat with an LLM (OpenRouter or OpenCode Go), streamed, with follow-ups.",
   "kinds": ["panel"],
   "keepLoaded": true,
   "entryPoints": { "panel": "Panel.qml" }

@@ -5,8 +5,8 @@
 // with a JSON payload carrying the primary selection and the source window:
 //   omarchy-shell shell toggle io.github.tnep4.recast '{"selection":"…","app":"Firefox","addr":"0x..","class":"firefox","mode":"transform"}'
 //
-// Streams OpenRouter completions (curl -N SSE) into a scrolling conversation, with follow-ups,
-// copy, regenerate, and insert-into-source-app.
+// Streams completions (curl -N SSE) from OpenRouter or OpenCode Go into a scrolling
+// conversation, with follow-ups, copy, regenerate, and insert-into-source-app.
 import QtQuick
 import Quickshell
 import Quickshell.Io
@@ -23,6 +23,32 @@ Item {
 
   // ---- config / constants -------------------------------------------------------------
   readonly property string apiUrl: "https://openrouter.ai/api/v1/chat/completions"
+  // OpenCode Go (subscription key via /connect). Three endpoint families:
+  // chat/completions (most models), messages (minimax/qwen), responses (grok/luna/muse-spark).
+  readonly property string goChatUrl: "https://opencode.ai/zen/go/v1/chat/completions"
+  readonly property string goMessagesUrl: "https://opencode.ai/zen/go/v1/messages"
+  readonly property string goResponsesUrl: "https://opencode.ai/zen/go/v1/responses"
+  readonly property string goModelsUrl: "https://opencode.ai/zen/go/v1/models"
+  // bare Go model ids routed to the Responses API (docs Endpoints table)
+  readonly property var goResponsesIds: ["grok-4.7", "grok-4.6", "gpt-6-luna", "gpt-5.6-luna",
+    "muse-spark-1.3-contributor", "muse-spark-1.2-contributor"]
+  // bare Go model ids routed to the Messages (Anthropic-compatible) API
+  readonly property var goMessagesIds: ["minimax-m3", "minimax-m2.7",
+    "qwen3.8-max", "qwen3.8-flash", "qwen3.7-plus"]
+  // active provider: "openrouter" | "opencode-go" (openai/anthropic come later)
+  property string provider: "openrouter"
+  property string goApiKey: String(Quickshell.env("OPENCODE_GO_API_KEY") || Quickshell.env("OPENCODE_API_KEY") || "")
+  property var goModels: []            // fetched from goModelsUrl: {id,label,reasoning}[]
+  property var goCustomModels: []      // user-added Go ids ("opencode-go/<id>" or bare)
+  property bool goModelsLoading: false
+  property string goModelsError: ""
+  property string goModelsBuf: ""      // raw /v1/models response accumulator
+  property string sessionId: ""        // stable per conversation, sent as x-opencode-session
+  property string streamKind: "chat"   // "chat" | "go-messages" | "go-responses"
+  readonly property var providers: [
+    { id: "openrouter", label: "OpenRouter" },
+    { id: "opencode-go", label: "OpenCode Go" }
+  ]
   readonly property string transformPrompt:
     "You transform text. The user gives an instruction and a piece of text. Apply the " +
     "instruction to the text and reply with ONLY the transformed text: no preamble, no " +
@@ -70,27 +96,34 @@ Item {
   ]
   // user-added OpenRouter model paths (org/slug), each {id,label,reasoning}; persisted to config
   property var customModels: []
-  readonly property var allModels: root.models.concat(root.customModels)
+  // provider-aware model list: OpenRouter built-ins + customs, or fetched Go + Go customs.
+  // Go ids are stored prefixed ("opencode-go/<id>", like the opencode config format).
+  readonly property var allModels: root.provider === "opencode-go"
+    ? root.goModels.concat(root.goCustomModels) : root.models.concat(root.customModels)
+  // custom ids of the *inactive* provider live here so the Settings repeater can stay simple
+  readonly property var activeCustomModels: root.provider === "opencode-go" ? root.goCustomModels : root.customModels
   property string model: "moonshotai/kimi-k3"
   property string effort: "default"
   property bool autoCopy: true
   property bool renderMarkdown: true     // light markdown in answers (toggle in settings)
+  property bool webSearch: false         // web plugin: OpenRouter always, Go chat endpoint (trial)
   property string userSystemPrompt: ""   // empty = use the built-in transformPrompt
   property string location: ""           // for the {location} placeholder (Omarchy weather setting)
   readonly property string configPath: Quickshell.env("HOME") + "/.config/recast/config.json"
 
   property bool settingsOpen: false
-  // dropdown state (shared by the left Menu and the model/effort pickers)
-  property string pickerKind: ""   // "" | "menu" | "model" | "effort"
+  // dropdown state (shared by the left Menu and the model/effort/provider pickers)
+  property string pickerKind: ""   // "" | "menu" | "model" | "effort" | "provider"
   property int pickerIndex: 0
   onPickerIndexChanged: root.ensurePickerVisible()
-  property string pickerFilter: ""       // type-to-filter within the model/effort dropdown
-  readonly property bool pickerFilterable: pickerKind === "model" || pickerKind === "effort"
+  property string pickerFilter: ""       // type-to-filter within the model/effort/provider dropdown
+  readonly property bool pickerFilterable: pickerKind === "model" || pickerKind === "effort" || pickerKind === "provider"
   readonly property var menuItems: [{ id: "new", label: "New", hint: "Ctrl+N" }, { id: "settings", label: "Settings", hint: "Ctrl+," }]
   readonly property var pickerOptions: {
     var base = pickerKind === "model" ? root.allModels
       : (pickerKind === "effort" ? root.efforts
-      : (pickerKind === "menu" ? root.menuItems : []))
+      : (pickerKind === "provider" ? root.providers
+      : (pickerKind === "menu" ? root.menuItems : [])))
     if (!root.pickerFilterable || root.pickerFilter === "") return base
     var f = root.pickerFilter.toLowerCase(), out = []
     for (var i = 0; i < base.length; i++) if (base[i].label.toLowerCase().indexOf(f) !== -1) out.push(base[i])
@@ -205,8 +238,12 @@ Item {
     root.actionFocus = -1
     root.pickerKind = ""
     root.settingsOpen = false
+    root.sessionId = ""
+    root.streamKind = "chat"
     root.opened = true
     if (!root.apiKey) keyProc.running = true
+    if (!root.goApiKey) keyGoProc.running = true
+    else root.maybeFetchGoModels()
     Qt.callLater(function () { input.forceActiveFocus() })
   }
   function close() {
@@ -219,11 +256,20 @@ Item {
   // IPC hook for scripting/testing: set the instruction and send.
   function sendText(t) { input.text = t; root.send(); return "ok" }
 
-  // ---- OpenRouter streaming -----------------------------------------------------------
+  // ---- streaming (OpenRouter + OpenCode Go) ---------------------------------------------
   function send() {
     var instruction = input.text.replace(/^\s+|\s+$/g, "")
     if (root.busy || instruction === "") return
-    if (!root.apiKey) { root.errorText = "No API key. Set OPENROUTER_API_KEY or store it in the keyring."; return }
+    if (!root.activeKey()) {
+      root.errorText = root.provider === "opencode-go"
+        ? "No OpenCode Go key. Run /connect in opencode, set OPENCODE_GO_API_KEY, or store it in the keyring (Settings)."
+        : "No API key. Set OPENROUTER_API_KEY or store it in the keyring."
+      return
+    }
+    if (root.provider === "opencode-go" && (root.model === "" || root.allModels.length === 0)) {
+      root.errorText = "No OpenCode Go model loaded. Open Settings → Refresh models."
+      return
+    }
 
     if (root.messages.length === 0) {
       if (root.selection !== "") {
@@ -242,6 +288,11 @@ Item {
     }
     root.history = root.history.concat([{ role: "user", text: instruction, isError: false }])
     root.pendingUser = instruction
+    // stable session id per conversation (Go uses it for routing + prompt caching)
+    if (root.sessionId === "") {
+      root.sessionId = "recast-" + Date.now().toString(36) + "-"
+        + Math.floor(Math.random() * 1679616).toString(36)
+    }
 
     input.text = ""
     root.answer = ""
@@ -254,9 +305,12 @@ Item {
   }
 
   function startStream() {
+    if (root.provider === "opencode-go") { root.startGoStream(); return }
+    root.streamKind = "chat"
     var payload = { model: root.model, messages: root.messages, stream: true }
     if (root.effort !== "default" && root.modelReasoning(root.model))
       payload.reasoning = { effort: root.effort }
+    if (root.webSearch) payload.plugins = [{ id: "web", max_results: 5 }]
     var body = JSON.stringify(payload)
     streamProc.command = [
       "curl", "-sN", "-X", "POST", root.apiUrl,
@@ -269,18 +323,88 @@ Item {
     streamProc.running = true
   }
 
+  // OpenCode Go: one provider, three endpoint families (see goResponsesIds/goMessagesIds).
+  // Model ids are stored prefixed ("opencode-go/<id>"); the API expects the bare id.
+  function startGoStream() {
+    var bare = root.goApiId(root.model)
+    var kind = "chat", url = root.goChatUrl
+    if (root.goResponsesIds.indexOf(bare) !== -1) { kind = "go-responses"; url = root.goResponsesUrl }
+    else if (root.goMessagesIds.indexOf(bare) !== -1) { kind = "go-messages"; url = root.goMessagesUrl }
+    root.streamKind = kind
+    var base = ["curl", "-sN", "-X", "POST", url,
+      "-H", "Authorization: Bearer " + root.goApiKey,
+      "-H", "Content-Type: application/json",
+      "-H", "x-opencode-session: " + root.sessionId,
+      "--user-agent", "recast/0.2"]
+    var body, i, m
+    if (kind === "go-messages") {
+      // Anthropic-compatible: system is top-level, max_tokens required, no system role in messages
+      var sys = "", rest = []
+      for (i = 0; i < root.messages.length; i++) {
+        m = root.messages[i]
+        if (m.role === "system") sys += (sys !== "" ? "\n" : "") + String(m.content)
+        else rest.push({ role: m.role, content: String(m.content) })
+      }
+      if (rest.length === 0) rest.push({ role: "user", content: "(empty)" })
+      var mp = { model: bare, max_tokens: 4096, stream: true, messages: rest }
+      if (sys !== "") mp.system = sys
+      body = JSON.stringify(mp)
+      // Go messages gateway expects the Anthropic-style key header (Bearer alone → "Missing API key")
+      streamProc.command = base.concat(["-H", "anthropic-version: 2023-06-01", "-H", "x-api-key: " + root.goApiKey, "-d", body])
+    } else if (kind === "go-responses") {
+      var inp = []
+      for (i = 0; i < root.messages.length; i++) {
+        m = root.messages[i]
+        inp.push({ role: m.role === "system" ? "developer" : m.role, content: String(m.content) })
+      }
+      body = JSON.stringify({ model: bare, input: inp, stream: true })
+      streamProc.command = base.concat(["-d", body])
+    } else {
+      // chat/completions (OpenAI-compatible): OpenRouter web plugin shape, trial on Go
+      var cp = { model: bare, messages: root.messages, stream: true }
+      if (root.webSearch) cp.plugins = [{ id: "web", max_results: 5 }]
+      body = JSON.stringify(cp)
+      streamProc.command = base.concat(["-d", body])
+    }
+    streamProc.running = true
+  }
+
   // SplitParser can hand us a chunk holding one SSE line (often with a leading newline from
   // the blank line between events) or several at once — normalize and scan every line.
+  // Three formats: OpenAI-compatible chat (choices[0].delta.content), Anthropic messages
+  // (content_block_delta → delta.text), OpenAI responses (response.output_text.delta → delta).
   function onSseLine(data) {
     var lines = String(data).split("\n")
     for (var i = 0; i < lines.length; i++) {
       var line = lines[i].replace(/^\s+|\s+$/g, "")
-      if (line.indexOf("data:") !== 0) continue    // skip ": OPENROUTER PROCESSING" keep-alives, blanks
+      if (line.indexOf("data:") !== 0) continue    // skip keep-alives (: OPENROUTER PROCESSING), event: lines, blanks
       var payload = line.substring(5).replace(/^\s+|\s+$/g, "")
       if (payload === "" || payload === "[DONE]") continue
       var chunk
       try { chunk = JSON.parse(payload) } catch (e) { continue }
       if (chunk.error) { root.errorText = "Error: " + (chunk.error.message || JSON.stringify(chunk.error)); continue }
+      if (root.streamKind === "go-messages") {
+        if (chunk.type === "error") {
+          root.errorText = "Error: " + (chunk.message || (chunk.error && chunk.error.message) || payload)
+          continue
+        }
+        var mdelta = chunk.delta && chunk.delta.text
+        if (chunk.type === "content_block_delta" && typeof mdelta === "string" && mdelta !== "") {
+          root.streaming = true; root.answer += mdelta
+        }
+        continue
+      }
+      if (root.streamKind === "go-responses") {
+        if (chunk.type === "error") {
+          root.errorText = "Error: " + (chunk.message || chunk.code || payload)
+          continue
+        }
+        if ((chunk.type === "response.output_text.delta" || chunk.type === "response.refusal.delta")
+            && typeof chunk.delta === "string" && chunk.delta !== "") {
+          root.streaming = true; root.answer += chunk.delta
+        }
+        continue
+      }
       var ch = chunk.choices && chunk.choices[0]
       var delta = ch && ch.delta && ch.delta.content
       if (delta) { root.streaming = true; root.answer += delta }
@@ -350,13 +474,48 @@ Item {
   function scrollToBottom() { flick.contentY = Math.max(0, flick.contentHeight - flick.height) }
 
   // ---- model / effort pickers + config persistence ------------------------------------
+  function providerLabel(id) {
+    for (var i = 0; i < root.providers.length; i++) if (root.providers[i].id === id) return root.providers[i].label
+    return id
+  }
+  // key of the active provider (env → keyring/auth.json → "")
+  function activeKey() { return root.provider === "opencode-go" ? root.goApiKey : root.apiKey }
+  function modelKnown(id) {
+    for (var i = 0; i < root.allModels.length; i++) if (root.allModels[i].id === id) return true
+    return false
+  }
+  // "opencode-go/kimi-k3" -> "kimi-k3" (the id the Go API expects); others unchanged
+  function goApiId(id) {
+    var s = String(id)
+    return s.indexOf("opencode-go/") === 0 ? s.substring("opencode-go/".length) : s
+  }
+  function preferredGoModel(list) {
+    for (var i = 0; i < list.length; i++) if (list[i].id === "opencode-go/kimi-k3") return list[i].id
+    return list.length > 0 ? list[0].id : ""
+  }
+  function setProvider(id) {
+    if (id !== "openrouter" && id !== "opencode-go") return
+    if (root.provider === id) return
+    root.provider = id
+    if (!root.modelKnown(root.model)) {
+      if (id === "opencode-go") {
+        if (root.allModels.length > 0) root.model = root.preferredGoModel(root.allModels)
+        // else: list still loading — send() guides the user to Settings → Refresh
+      } else {
+        root.model = root.models[0].id
+      }
+    }
+    saveConfig()
+    root.maybeFetchGoModels()
+  }
   function indexOfId(list, id) { for (var i = 0; i < list.length; i++) if (list[i].id === id) return i; return 0 }
   function togglePicker(kind) {
     root.pickerFilter = ""
     if (root.pickerKind === kind) { root.pickerKind = ""; return }
     root.pickerKind = kind
     root.pickerIndex = (kind === "model") ? root.indexOfId(root.allModels, root.model)
-      : (kind === "effort" ? root.indexOfId(root.efforts, root.effort) : 0)
+      : (kind === "effort" ? root.indexOfId(root.efforts, root.effort)
+      : (kind === "provider" ? root.indexOfId(root.providers, root.provider) : 0))
     Qt.callLater(root.ensurePickerVisible)
   }
   // keep the highlighted row within the scroll viewport (keyboard nav)
@@ -385,6 +544,7 @@ Item {
     if (opt) {
       if (root.pickerKind === "model") root.setModel(opt.id)
       else if (root.pickerKind === "effort") root.setEffort(opt.id)
+      else if (root.pickerKind === "provider") root.setProvider(opt.id)
       else if (root.pickerKind === "menu") root.runMenu(opt.id)
     }
     root.pickerKind = ""; root.pickerFilter = ""
@@ -399,6 +559,7 @@ Item {
     root.answer = ""; root.errorText = ""; root.lastAnswer = ""; root.copiedHint = ""
     root.pendingUser = ""; root.actionFocus = -1
     root.busy = false; root.streaming = false
+    root.sessionId = ""
     input.text = ""
     Qt.callLater(function () { input.forceActiveFocus() })
   }
@@ -455,6 +616,7 @@ Item {
     var alt = event.modifiers & Qt.AltModifier
 
     if (ctrl && event.key === Qt.Key_M) { root.togglePicker("model"); event.accepted = true; return }
+    if (ctrl && event.key === Qt.Key_P) { root.togglePicker("provider"); event.accepted = true; return }
     if (ctrl && event.key === Qt.Key_E && root.modelReasoning(root.model)) { root.togglePicker("effort"); event.accepted = true; return }
     if (ctrl && event.key === Qt.Key_Comma) { root.openSettings(); event.accepted = true; return }
     if (ctrl && event.key === Qt.Key_N) { root.newConversation(); event.accepted = true; return }
@@ -503,12 +665,25 @@ Item {
   }
   function setModel(id) { root.model = id; saveConfig() }
   function setEffort(id) { root.effort = id; saveConfig() }
-  // add a custom OpenRouter model by path (org/slug). Returns true if accepted.
+  // add a custom model. OpenRouter: path (org/slug). OpenCode Go: bare id or opencode-go/<id>.
+  // Returns true if accepted.
   function addCustomModel(path) {
     var p = String(path).replace(/^\s+|\s+$/g, "")
+    if (root.provider === "opencode-go") {
+      if (p === "" || /\s/.test(p)) return false
+      if (p.indexOf("opencode-go/") !== 0) p = "opencode-go/" + p.replace(/^\/+/, "")
+      for (var i = 0; i < root.allModels.length; i++)
+        if (root.allModels[i].id === p) { root.model = p; saveConfig(); return true }
+      var glist = root.goCustomModels.slice()
+      glist.push({ id: p, label: root.prettyModel(p), reasoning: false })
+      root.goCustomModels = glist
+      root.model = p
+      saveConfig()
+      return true
+    }
     if (p === "" || p.indexOf("/") < 1 || /\s/.test(p)) return false   // must be org/slug, no spaces
-    for (var i = 0; i < root.allModels.length; i++)
-      if (root.allModels[i].id === p) { root.model = p; saveConfig(); return true }   // already known → just select it
+    for (var j = 0; j < root.allModels.length; j++)
+      if (root.allModels[j].id === p) { root.model = p; saveConfig(); return true }   // already known → just select it
     var list = root.customModels.slice()
     list.push({ id: p, label: root.prettyModel(p), reasoning: true })
     root.customModels = list
@@ -517,33 +692,90 @@ Item {
     return true
   }
   function removeCustomModel(id) {
-    var list = []
-    for (var i = 0; i < root.customModels.length; i++)
-      if (root.customModels[i].id !== id) list.push(root.customModels[i])
-    root.customModels = list
-    if (root.model === id) root.model = root.models[0].id   // fall back to a built-in
+    if (root.provider === "opencode-go") {
+      var glist = []
+      for (var i = 0; i < root.goCustomModels.length; i++)
+        if (root.goCustomModels[i].id !== id) glist.push(root.goCustomModels[i])
+      root.goCustomModels = glist
+    } else {
+      var list = []
+      for (var j = 0; j < root.customModels.length; j++)
+        if (root.customModels[j].id !== id) list.push(root.customModels[j])
+      root.customModels = list
+    }
+    if (root.model === id)
+      root.model = root.allModels.length > 0 ? root.allModels[0].id
+        : (root.provider === "opencode-go" ? "" : root.models[0].id)
     saveConfig()
+  }
+  // ---- OpenCode Go model discovery (no hardcoded models) ------------------------------
+  // Fetches GET goModelsUrl (public — works even without a key) → {data:[{id}]}. Cached to config.
+  function maybeFetchGoModels() {
+    if (root.provider !== "opencode-go" || root.goModelsLoading) return
+    if (root.goModels.length > 0) return
+    fetchGoModels()
+  }
+  function fetchGoModels() {
+    if (root.goModelsLoading) return
+    root.goModelsLoading = true
+    root.goModelsError = ""
+    root.goModelsBuf = ""
+    var cmd = ["curl", "-s", root.goModelsUrl, "--user-agent", "recast/0.2"]
+    if (root.goApiKey) cmd = cmd.concat(["-H", "Authorization: Bearer " + root.goApiKey])
+    goModelsProc.command = cmd
+    goModelsProc.running = true
+  }
+  function onGoModelsDone(exitCode) {
+    root.goModelsLoading = false
+    if (exitCode !== 0) { root.goModelsError = "Models fetch failed (curl exit " + exitCode + ")."; return }
+    var data
+    try { data = JSON.parse(root.goModelsBuf || "{}") } catch (e) { root.goModelsError = "Bad models response."; return }
+    if (!data || !Array.isArray(data.data) || data.data.length === 0) {
+      root.goModelsError = "No models returned."
+      return
+    }
+    var out = []
+    for (var i = 0; i < data.data.length; i++) {
+      var id = data.data[i] && data.data[i].id
+      if (!id) continue
+      var full = "opencode-go/" + String(id)
+      out.push({ id: full, label: root.prettyModel(full), reasoning: false })
+    }
+    out.sort(function (a, b) { return a.label < b.label ? -1 : (a.label > b.label ? 1 : 0) })
+    root.goModels = out
+    if (!root.modelKnown(root.model)) root.model = root.preferredGoModel(out)
+    saveConfig()
+  }
+  function goModelsStatus() {
+    if (root.goModelsLoading) return "Loading models…"
+    if (root.goModelsError !== "") return root.goModelsError
+    if (root.goModels.length > 0) return root.goModels.length + " models available."
+    return "Model list not loaded yet."
   }
   function saveConfig() {
     cfgFile.setText(JSON.stringify({
-      model: root.model, effort: root.effort, autoCopy: root.autoCopy,
-      renderMarkdown: root.renderMarkdown, systemPrompt: root.userSystemPrompt,
-      customModels: root.customModels.map(function (m) { return m.id })
+      provider: root.provider, model: root.model, effort: root.effort, autoCopy: root.autoCopy,
+      renderMarkdown: root.renderMarkdown, webSearch: root.webSearch,
+      systemPrompt: root.userSystemPrompt,
+      customModels: root.customModels.map(function (m) { return m.id }),
+      goCustomModels: root.goCustomModels.map(function (m) { return m.id }),
+      goModelsCache: root.goModels.map(function (m) { return m.id })
     }, null, 2) + "\n")
   }
   function openSettings() {
     sysEdit.text = root.userSystemPrompt !== "" ? root.userSystemPrompt : root.transformPrompt
     root.settingsOpen = true
-    Qt.callLater(function () { keyField.forceActiveFocus() })
+    Qt.callLater(function () { (root.provider === "opencode-go" ? keyGoField : keyField).forceActiveFocus() })
   }
   function closeSettings() {
     root.userSystemPrompt = (sysEdit.text === root.transformPrompt) ? "" : sysEdit.text
     saveConfig()
-    root.settingsOpen = false; keyField.text = ""
+    root.settingsOpen = false; keyField.text = ""; keyGoField.text = ""
     Qt.callLater(function () { input.forceActiveFocus() })
   }
   function toggleAutoCopy() { root.autoCopy = !root.autoCopy; saveConfig() }
   function toggleMarkdown() { root.renderMarkdown = !root.renderMarkdown; saveConfig() }
+  function toggleWebSearch() { root.webSearch = !root.webSearch; saveConfig() }
   function resetSystemPrompt() { sysEdit.text = root.transformPrompt }
 
   FileView {
@@ -555,13 +787,21 @@ Item {
     onLoaded: {
       try {
         var c = JSON.parse(text() || "{}")
+        if (c.provider === "openrouter" || c.provider === "opencode-go") root.provider = c.provider
         if (c.model) root.model = c.model
         if (c.effort) root.effort = c.effort
         if (c.autoCopy !== undefined) root.autoCopy = !!c.autoCopy
         if (c.renderMarkdown !== undefined) root.renderMarkdown = !!c.renderMarkdown
+        if (c.webSearch !== undefined) root.webSearch = !!c.webSearch
         if (c.systemPrompt !== undefined) root.userSystemPrompt = String(c.systemPrompt || "")
         if (Array.isArray(c.customModels))
           root.customModels = c.customModels.map(function (id) { return { id: String(id), label: root.prettyModel(id), reasoning: true } })
+        if (Array.isArray(c.goCustomModels))
+          root.goCustomModels = c.goCustomModels.map(function (id) { return { id: String(id), label: root.prettyModel(id), reasoning: false } })
+        if (Array.isArray(c.goModelsCache))
+          root.goModels = c.goModelsCache.map(function (id) { return { id: String(id), label: root.prettyModel(id), reasoning: false } })
+        // old configs have no provider: an opencode-go/… model implies the Go provider
+        if (!c.provider && String(root.model).indexOf("opencode-go/") === 0) root.provider = "opencode-go"
       } catch (e) {}
     }
   }
@@ -573,6 +813,23 @@ Item {
       "secret-tool lookup service openrouter app recast 2>/dev/null || secret-tool lookup service openrouter app ai-transform 2>/dev/null"]
     stdout: SplitParser { onRead: function (data) { if (!root.apiKey) root.apiKey = data.replace(/^\s+|\s+$/g, "") } }
   }
+  Process {
+    id: keyGoProc
+    // keyring first, then the key saved by opencode's own /connect flow (auth.json)
+    command: ["bash", "-c",
+      "secret-tool lookup service opencode-go app recast 2>/dev/null || jq -r '.[\"opencode-go\"].key // empty' ~/.local/share/opencode/auth.json 2>/dev/null"]
+    stdout: SplitParser { onRead: function (data) {
+      if (!root.goApiKey) {
+        var k = data.replace(/^\s+|\s+$/g, "")
+        if (k !== "") { root.goApiKey = k; root.maybeFetchGoModels() }
+      }
+    } }
+  }
+  Process {
+    id: goModelsProc
+    stdout: SplitParser { onRead: function (data) { root.goModelsBuf += data + "\n" } }
+    onExited: function (exitCode, exitStatus) { root.onGoModelsDone(exitCode) }
+  }
   Process { id: keyStoreProc }
   function storeKey(k) {
     root.apiKey = k
@@ -580,6 +837,14 @@ Item {
       "printf %s \"$1\" | secret-tool store --label='Recast (OpenRouter)' service openrouter app recast",
       "--", k]
     keyStoreProc.running = true
+  }
+  function storeGoKey(k) {
+    root.goApiKey = k
+    keyStoreProc.command = ["bash", "-c",
+      "printf %s \"$1\" | secret-tool store --label='Recast (OpenCode Go)' service opencode-go app recast",
+      "--", k]
+    keyStoreProc.running = true
+    root.maybeFetchGoModels()
   }
   Process {
     id: streamProc
@@ -688,14 +953,60 @@ Item {
               Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: Util.alpha(Color.menu.border, 0.4) }
             }
 
-            // custom models — add any OpenRouter model path; they join the top-bar model picker
+            // OpenCode Go key (subscription via opencode's /connect)
+            Item {
+              width: parent.width; height: keyGoCol.implicitHeight + root.padV * 2
+              Column {
+                id: keyGoCol
+                x: root.padH; y: root.padV; width: parent.width - root.padH * 2; spacing: 8
+                Text { text: "OpenCode Go API key"; color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall }
+                Rectangle {
+                  width: parent.width; height: Style.font.body + 18; color: "transparent"
+                  border.color: keyGoField.activeFocus ? Color.menu.selectedText : Util.alpha(Color.menu.border, 0.5); border.width: 1
+                  TextInput {
+                    id: keyGoField
+                    anchors.fill: parent; anchors.leftMargin: 10; anchors.rightMargin: 10
+                    verticalAlignment: TextInput.AlignVCenter; echoMode: TextInput.Password
+                    color: Color.menu.text; font.family: Style.font.family; font.pixelSize: Style.font.body; clip: true
+                    cursorDelegate: Rectangle { width: 2; height: keyGoField.cursorRectangle.height; color: Color.accent }
+                    Text { anchors.verticalCenter: parent.verticalCenter; visible: keyGoField.text.length === 0; text: "paste from opencode /connect…"; color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.body }
+                    Keys.onReturnPressed: { if (keyGoField.text.length > 0) root.storeGoKey(keyGoField.text); root.closeSettings() }
+                    Keys.onEnterPressed: { if (keyGoField.text.length > 0) root.storeGoKey(keyGoField.text); root.closeSettings() }
+                    Keys.onEscapePressed: root.closeSettings()
+                  }
+                }
+                Text { width: parent.width; text: (root.goApiKey !== "" ? "A key is set. " : "") + "Read from opencode's auth.json (/connect), OPENCODE_GO_API_KEY, or the keyring — never written to disk."; color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall; wrapMode: Text.WordWrap }
+                Item {
+                  width: parent.width; height: Math.max(goStatus.implicitHeight, goRefresh.implicitHeight)
+                  Text {
+                    id: goStatus
+                    anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter
+                    width: parent.width - goRefresh.implicitWidth - 12
+                    text: root.goModelsStatus()
+                    color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall
+                    wrapMode: Text.WordWrap
+                  }
+                  Text {
+                    id: goRefresh
+                    anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+                    text: root.goModelsLoading ? "Loading…" : "Refresh"
+                    color: root.goModelsLoading ? Color.muted : Color.accent
+                    font.family: Style.font.family; font.pixelSize: Style.font.bodySmall
+                    MouseArea { anchors.fill: parent; anchors.margins: -6; enabled: !root.goModelsLoading; onClicked: root.fetchGoModels() }
+                  }
+                }
+              }
+              Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: Util.alpha(Color.menu.border, 0.4) }
+            }
+
+            // custom models — provider-aware extras; they join the top-bar model picker
             Item {
               width: parent.width; height: cmCol.implicitHeight + root.padV * 2
               Column {
                 id: cmCol
                 x: root.padH; y: root.padV; width: parent.width - root.padH * 2; spacing: 8
                 Text { text: "Custom models"; color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall }
-                // add field: paste an OpenRouter path, Enter to add
+                // add field: paste a model id, Enter to add
                 Rectangle {
                   width: parent.width; height: Style.font.body + 18; color: "transparent"
                   border.color: cmField.activeFocus ? Color.menu.selectedText : Util.alpha(Color.menu.border, 0.5); border.width: 1
@@ -710,14 +1021,16 @@ Item {
                     Keys.onEscapePressed: root.closeSettings()
                     Text {
                       anchors.verticalCenter: parent.verticalCenter; visible: cmField.text.length === 0
-                      text: "openai/gpt-4o — paste a model path, press Enter"
+                      text: root.provider === "opencode-go"
+                        ? "kimi-k3 — paste a Go model id, press Enter"
+                        : "openai/gpt-4o — paste a model path, press Enter"
                       color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.body
                     }
                   }
                 }
                 // current custom models, each with a remove control
                 Repeater {
-                  model: root.customModels
+                  model: root.activeCustomModels
                   delegate: Item {
                     required property var modelData
                     required property int index
@@ -744,15 +1057,17 @@ Item {
                       MouseArea { anchors.fill: parent; anchors.margins: -6; onClicked: root.removeCustomModel(modelData.id) }
                     }
                     Rectangle {
-                      visible: index < root.customModels.length - 1   // between rows, not after the last
+                      visible: index < root.activeCustomModels.length - 1   // between rows, not after the last
                       anchors.bottom: parent.bottom; width: parent.width; height: 1
                       color: Util.alpha(Color.menu.border, 0.25)
                     }
                   }
                 }
                 Text {
-                  visible: root.customModels.length === 0
-                  text: "Add the newest OpenRouter models here — they show up in the model picker."
+                  visible: root.activeCustomModels.length === 0
+                  text: root.provider === "opencode-go"
+                    ? "Extra Go model ids live here — they show up in the model picker."
+                    : "Add the newest OpenRouter models here — they show up in the model picker."
                   color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall
                 }
               }
@@ -790,6 +1105,28 @@ Item {
                 Text { anchors.verticalCenter: parent.verticalCenter; text: "Render light markdown in answers"; color: Color.menu.text; font.family: Style.font.family; font.pixelSize: Style.font.body }
               }
               MouseArea { anchors.fill: parent; onClicked: root.toggleMarkdown() }
+              Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: Util.alpha(Color.menu.border, 0.4) }
+            }
+
+            // web-search toggle (OpenRouter web plugin; also sent to the Go chat endpoint)
+            Item {
+              width: parent.width; height: webCol.implicitHeight + root.padV * 2
+              Column {
+                id: webCol
+                x: root.padH; y: root.padV; width: parent.width - root.padH * 2; spacing: 4
+                Row {
+                  spacing: 12
+                  Rectangle {
+                    width: 16; height: 16; anchors.verticalCenter: parent.verticalCenter
+                    color: root.webSearch ? Color.accent : "transparent"
+                    border.color: root.webSearch ? Color.accent : Util.alpha(Color.menu.border, 0.6); border.width: 1
+                    Text { anchors.centerIn: parent; visible: root.webSearch; text: "✓"; color: Color.menu.background; font.pixelSize: 11; font.family: Style.font.family }
+                  }
+                  Text { anchors.verticalCenter: parent.verticalCenter; text: "Search the web before answering"; color: Color.menu.text; font.family: Style.font.family; font.pixelSize: Style.font.body }
+                }
+                Text { width: parent.width; wrapMode: Text.WordWrap; text: "OpenRouter: web plugin (~$0.007/search + tokens). Go: sent to chat models only; if the gateway rejects it, turn this off."; color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall }
+              }
+              MouseArea { anchors.fill: parent; onClicked: root.toggleWebSearch() }
               Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: Util.alpha(Color.menu.border, 0.4) }
             }
 
@@ -960,6 +1297,7 @@ Item {
               anchors.verticalCenter: parent.verticalCenter
               anchors.right: parent.right; anchors.rightMargin: root.padH
               spacing: 16
+              TopPicker { label: root.providerLabel(root.provider); active: root.pickerKind === "provider"; onClicked: root.togglePicker("provider") }
               TopPicker { label: root.modelLabel(root.model); active: root.pickerKind === "model"; onClicked: root.togglePicker("model") }
               TopPicker { visible: root.modelReasoning(root.model); label: root.effortLabel(root.effort); active: root.pickerKind === "effort"; onClicked: root.togglePicker("effort") }
             }

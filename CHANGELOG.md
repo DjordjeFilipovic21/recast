@@ -3,6 +3,19 @@
 All notable changes to Recast are documented here. This project follows
 [Semantic Versioning](https://semver.org).
 
+## Unreleased
+
+### Added
+
+- OpenCode Go provider: pick OpenRouter or OpenCode Go in the top bar (`Ctrl+P`), with the
+  model list fetched from `https://opencode.ai/zen/go/v1/models` (nothing hardcoded, cached to
+  `config.json`, Refresh button in Settings). Per-model routing to Go's `chat/completions`,
+  `messages` (Anthropic-compatible, `x-api-key`), and `responses` endpoints, plus the
+  `x-opencode-session` header.
+- Go key resolution: opencode's `auth.json` (`/connect`), `OPENCODE_GO_API_KEY` /
+  `OPENCODE_API_KEY`, or the system keyring (`service opencode-go, app recast`).
+- Web search toggle: OpenRouter `web` plugin for any model; also sent to Go chat models (trial).
+
 ## v0.1.0 - 2026-09-07
 
 First public release.
