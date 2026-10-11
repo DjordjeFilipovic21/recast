@@ -20,6 +20,9 @@ All notable changes to Recast are documented here. This project follows
   results as context (works with every Go endpoint family). New Settings field for the
   Tavily key (`TAVILY_API_KEY` env or keyring `service tavily, app recast`), "Searching
   the web…" indicator, graceful fallback to model knowledge when search fails.
+- Web fetch for OpenCode Go: URLs in a message are auto-detected (max 3, instruction only,
+  always on) and fetched via Tavily `/extract`, then search (if enabled), then stream.
+  "Fetching page…" indicator, ~6000 chars per page, stale context dropped on regenerate/retry.
 - Settings focus fixes: explicit Tab order across all fields (wraps from the system
   prompt back to the first key field), click-to-focus backup under each field, and
   mouse text selection in key/model fields.

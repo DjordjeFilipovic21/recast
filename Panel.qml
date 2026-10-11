@@ -111,7 +111,12 @@ Item {
   property bool searching: false         // Tavily lookup in flight (Go + webSearch)
   property string searchBuf: ""          // raw Tavily /search response accumulator
   property string searchError: ""        // last Tavily failure, shown in Settings
-  property bool searchCtxAppended: false // last message is an injected search-context block
+  property bool extracting: false        // Tavily /extract in flight (Go + linked URLs)
+  property string extractBuf: ""         // raw Tavily /extract response accumulator
+  property string extractError: ""       // last fetch failure, shown in Settings
+  property var fetchQueue: []            // URL batches waiting for /extract (one batch per turn)
+  property string pendingSearch: ""      // search query waiting until fetch finishes
+  property int ctxBlocks: 0              // trailing injected context blocks (fetch/search) to drop on retry
   property string userSystemPrompt: ""   // empty = use the built-in transformPrompt
   property string location: ""           // for the {location} placeholder (Omarchy weather setting)
   readonly property string configPath: Quickshell.env("HOME") + "/.config/recast/config.json"
@@ -246,7 +251,10 @@ Item {
     root.sessionId = ""
     root.streamKind = "chat"
     root.searching = false
-    root.searchCtxAppended = false
+    root.extracting = false
+    root.ctxBlocks = 0
+    root.fetchQueue = []
+    root.pendingSearch = ""
     root.opened = true
     if (!root.apiKey) keyProc.running = true
     if (!root.goApiKey) keyGoProc.running = true
@@ -258,7 +266,9 @@ Item {
     root.opened = false
     if (streamProc.running) streamProc.running = false
     if (searchProc.running) searchProc.running = false
+    if (extractProc.running) extractProc.running = false
     root.searching = false
+    root.extracting = false
     input.text = ""
   }
   function refresh() { return "ok" }
@@ -280,8 +290,13 @@ Item {
       root.errorText = "No OpenCode Go model loaded. Open Settings → Refresh models."
       return
     }
-    if (root.provider === "opencode-go" && root.webSearch && !root.tavilyApiKey) {
-      root.errorText = "Web search is on but no Tavily key. Set TAVILY_API_KEY or paste it in Settings → Web search."
+    // Go web grounding (search toggle and/or linked URLs) needs the Tavily key.
+    // Checked up front so a missing key fails before the user turn is recorded.
+    var fetchUrls = root.provider === "opencode-go" ? root.extractUrls(instruction) : []
+    if (root.provider === "opencode-go" && (root.webSearch || fetchUrls.length > 0) && !root.tavilyApiKey) {
+      root.errorText = (!root.webSearch && fetchUrls.length > 0)
+        ? "Link detected but no Tavily key. Set TAVILY_API_KEY or paste it in Settings → Web search."
+        : "Web search is on but no Tavily key. Set TAVILY_API_KEY or paste it in Settings → Web search."
       return
     }
 
@@ -315,9 +330,46 @@ Item {
     root.actionFocus = -1
     root.busy = true
     root.streaming = false
-    // Go has no server-side search: Recast queries Tavily itself, then streams with
-    // the results injected as context. OpenRouter keeps using its web plugin.
-    if (root.provider === "opencode-go" && root.webSearch) { root.runTavilySearch(instruction); return }
+    // Go has no server-side web access: Recast fetches linked pages and/or queries
+    // Tavily itself, then streams with the results injected as context.
+    // OpenRouter keeps using its web plugin.
+    if (root.provider === "opencode-go" && (fetchUrls.length > 0 || root.webSearch)) {
+      root.gatherContext(fetchUrls, root.webSearch ? instruction : "")
+      return
+    }
+    startStream()
+  }
+
+  // URLs in the instruction (not the selection) are fetched via Tavily /extract.
+  // Max 3 per turn, deduped, trailing punctuation stripped.
+  function extractUrls(text) {
+    var out = [], seen = {}
+    var re = /https?:\/\/[^\s)>\]"']+/g, m
+    while ((m = re.exec(String(text))) !== null && out.length < 3) {
+      var u = m[0].replace(/[.,;:!?]+$/, "")
+      if (u !== "" && !seen[u]) { seen[u] = true; out.push(u) }
+    }
+    return out
+  }
+  // context pipeline: fetch linked pages first, then web search, then stream.
+  function gatherContext(urls, query) {
+    root.fetchQueue = (urls && urls.length > 0) ? [urls] : []
+    root.pendingSearch = query || ""
+    root.gatherNext()
+  }
+  function gatherNext() {
+    if (root.fetchQueue.length > 0) {
+      var batch = root.fetchQueue[0]
+      root.fetchQueue = root.fetchQueue.slice(1)
+      root.runExtract(batch)
+      return
+    }
+    if (root.pendingSearch !== "") {
+      var q = root.pendingSearch
+      root.pendingSearch = ""
+      root.runTavilySearch(q)
+      return
+    }
     startStream()
   }
 
@@ -440,13 +492,13 @@ Item {
       var msg = root.errorText !== "" ? root.errorText
         : ((exitCode && exitCode !== 0) ? "Request failed (curl exit " + exitCode + ")" : "No response from the model.")
       // drop the failed user turn from the API history and prefill the input so a retry is clean
-      // (plus the injected Tavily search-context block, when one was used)
-      var drop = root.searchCtxAppended ? 2 : 1
+      // (plus any injected fetch/search context blocks)
+      var drop = 1 + root.ctxBlocks
       while (drop > 0 && root.messages.length > 0 && root.messages[root.messages.length - 1].role === "user") {
         root.messages = root.messages.slice(0, root.messages.length - 1)
         drop--
       }
-      root.searchCtxAppended = false
+      root.ctxBlocks = 0
       root.history = root.history.concat([{ role: "assistant", text: msg, isError: true }])
       root.errorText = ""
       input.text = root.pendingUser
@@ -475,13 +527,18 @@ Item {
     root.errorText = ""
     root.copiedHint = ""
     root.actionFocus = -1
-    if (root.searchCtxAppended && root.messages.length > 0 && root.messages[root.messages.length - 1].role === "user") {
-      root.messages = root.messages.slice(0, root.messages.length - 1)   // drop stale search context; a fresh one is fetched below
-      root.searchCtxAppended = false
+    // drop stale injected context (fetch/search); fresh context is gathered below
+    while (root.ctxBlocks > 0 && root.messages.length > 0 && root.messages[root.messages.length - 1].role === "user") {
+      root.messages = root.messages.slice(0, root.messages.length - 1)
+      root.ctxBlocks--
     }
+    root.ctxBlocks = 0
     root.busy = true
     root.streaming = false
-    if (root.provider === "opencode-go" && root.webSearch && root.tavilyApiKey) { root.runTavilySearch(root.pendingUser); return }
+    if (root.provider === "opencode-go" && root.tavilyApiKey) {
+      var urls = root.extractUrls(root.pendingUser)
+      if (urls.length > 0 || root.webSearch) { root.gatherContext(urls, root.webSearch ? root.pendingUser : ""); return }
+    }
     startStream()
   }
   function insertIntoSource() {
@@ -583,11 +640,13 @@ Item {
   function newConversation() {
     if (streamProc.running) streamProc.running = false
     if (searchProc.running) searchProc.running = false
+    if (extractProc.running) extractProc.running = false
     root.messages = []; root.history = []
     root.answer = ""; root.errorText = ""; root.lastAnswer = ""; root.copiedHint = ""
     root.pendingUser = ""; root.actionFocus = -1
-    root.busy = false; root.streaming = false; root.searching = false
-    root.searchCtxAppended = false
+    root.busy = false; root.streaming = false; root.searching = false; root.extracting = false
+    root.ctxBlocks = 0
+    root.fetchQueue = []; root.pendingSearch = ""
     root.sessionId = ""
     input.text = ""
     Qt.callLater(function () { input.forceActiveFocus() })
@@ -807,8 +866,8 @@ Item {
         var ctx = root.formatSearchContext(JSON.parse(root.searchBuf || "{}"))
         if (ctx !== "") {
           root.messages = root.messages.concat([{ role: "user", content: ctx }])
-          root.searchCtxAppended = true
-          startStream()
+          root.ctxBlocks++
+          root.gatherNext()
           return
         }
         root.searchError = "No usable results."
@@ -816,7 +875,7 @@ Item {
     } else {
       root.searchError = "Search failed (curl exit " + exitCode + ")."
     }
-    startStream()   // graceful: answer from model knowledge when search fails
+    root.gatherNext()   // graceful: answer from model knowledge when search fails
   }
   function formatSearchContext(d) {
     if (!d || !Array.isArray(d.results) || d.results.length === 0) return ""
@@ -833,8 +892,60 @@ Item {
   }
   function tavilyStatus() {
     if (root.searching) return "Searching…"
+    if (root.extracting) return "Fetching…"
     if (root.searchError !== "") return root.searchError
-    return (root.tavilyApiKey !== "" ? "A key is set. " : "") + "5 results per search, injected as context for Go models."
+    if (root.extractError !== "") return root.extractError
+    return (root.tavilyApiKey !== "" ? "A key is set. " : "")
+      + "5 results per search; pages linked in a message are fetched automatically."
+  }
+  // ---- Tavily page fetch (direct URL grounding for OpenCode Go) -----------------------
+  // One /extract call per turn (up to 3 URLs), content capped so a long page can't
+  // blow up the context. Same graceful fallback as search.
+  function runExtract(urls) {
+    root.extracting = true
+    root.extractError = ""
+    root.extractBuf = ""
+    var body = JSON.stringify({ urls: urls, extract_depth: "basic", include_images: false })
+    extractProc.command = ["curl", "-s", "-m", "60", "-X", "POST", "https://api.tavily.com/extract",
+      "-H", "Authorization: Bearer " + root.tavilyApiKey,
+      "-H", "Content-Type: application/json",
+      "--user-agent", "recast/0.2",
+      "-d", body]
+    extractProc.running = true
+  }
+  function onExtractDone(exitCode) {
+    root.extracting = false
+    if (exitCode === 0) {
+      try {
+        var d = JSON.parse(root.extractBuf || "{}")
+        var fails = Array.isArray(d.failed_results) ? d.failed_results : []
+        var ctx = root.formatExtractContext(d)
+        if (ctx !== "") {
+          root.messages = root.messages.concat([{ role: "user", content: ctx }])
+          root.ctxBlocks++
+        } else if (root.extractError === "") {
+          root.extractError = "No readable content."
+        }
+        if (fails.length > 0 && root.extractError === "")
+          root.extractError = "Some pages failed to fetch."
+      } catch (e) { root.extractError = "Bad fetch response." }
+    } else {
+      root.extractError = "Fetch failed (curl exit " + exitCode + ")."
+    }
+    root.gatherNext()
+  }
+  function formatExtractContext(d) {
+    if (!d || !Array.isArray(d.results) || d.results.length === 0) return ""
+    var out = ""
+    for (var i = 0; i < d.results.length; i++) {
+      var c = String(d.results[i].raw_content || "").replace(/^\s+|\s+$/g, "")
+      if (c === "") continue
+      if (c.length > 6000) c = c.substring(0, 6000) + "…"
+      out += "Fetched content from " + String(d.results[i].url || "link") + ":\n" + c + "\n\n"
+    }
+    if (out === "") return ""
+    return "Web page content the user linked (use it to ground your answer; cite with markdown links):\n\n"
+      + out.replace(/^\s+|\s+$/g, "")
   }
   function saveConfig() {
     cfgFile.setText(JSON.stringify({
@@ -941,6 +1052,7 @@ Item {
   function storeTavilyKey(k) {
     root.tavilyApiKey = k
     root.searchError = ""
+    root.extractError = ""
     keyStoreProc.command = ["bash", "-c",
       "printf %s \"$1\" | secret-tool store --label='Recast (Tavily)' service tavily app recast",
       "--", k]
@@ -950,6 +1062,11 @@ Item {
     id: searchProc
     stdout: SplitParser { onRead: function (data) { root.searchBuf += data + "\n" } }
     onExited: function (exitCode, exitStatus) { root.onSearchDone(exitCode) }
+  }
+  Process {
+    id: extractProc
+    stdout: SplitParser { onRead: function (data) { root.extractBuf += data + "\n" } }
+    onExited: function (exitCode, exitStatus) { root.onExtractDone(exitCode) }
   }
   Process {
     id: streamProc
@@ -1577,7 +1694,7 @@ Item {
               Text { text: root.modelLabel(root.model); color: Color.muted; font.family: Style.font.family; font.pixelSize: Style.font.bodySmall }
               Text {
                 width: parent.width
-                text: root.streaming ? root.mdSafe(root.answer, root.renderMarkdown) : (root.searching ? "Searching the web… " + root.spinnerFrames.charAt(root.spinIndex) : root.spinnerFrames.charAt(root.spinIndex))
+                text: root.streaming ? root.mdSafe(root.answer, root.renderMarkdown) : ((root.searching || root.extracting) ? (root.extracting ? "Fetching page… " : "Searching the web… ") + root.spinnerFrames.charAt(root.spinIndex) : root.spinnerFrames.charAt(root.spinIndex))
                 color: root.streaming ? Color.menu.text : Color.accent   // themed spinner glyph
                 font.family: Style.font.family; font.pixelSize: Style.font.body
                 wrapMode: Text.WordWrap

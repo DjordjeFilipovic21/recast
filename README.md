@@ -59,8 +59,8 @@ in the system keyring (never on disk). Two providers are supported — pick one 
 - **OpenRouter** — `OPENROUTER_API_KEY` env var or the Settings key field.
 - **OpenCode Go** (subscription via opencode's `/connect`) — picked up automatically from
   `~/.local/share/opencode/auth.json`, or set `OPENCODE_GO_API_KEY`, or paste it in Settings.
-- **Tavily** (web search for Go models) — set `TAVILY_API_KEY` or paste the key in Settings →
-  Web search. Get a free key at [tavily.com](https://tavily.com) (~1.000 pretraga/mesec free).
+- **Tavily** (web search + page fetch for Go models) — set `TAVILY_API_KEY` or paste the key
+  in Settings → Web search. Get a free key at [tavily.com](https://tavily.com) (~1.000 pretraga/mesec free).
 
 Dependencies (all in Omarchy's base): `curl`, `jq`, `wl-clipboard`, `libsecret` (`secret-tool`),
 plus `hyprctl` and the `omarchy-shell`. Location context uses `omarchy-weather-location` if present.
@@ -86,7 +86,9 @@ plus `hyprctl` and the `omarchy-shell`. Location context uses `omarchy-weather-l
 - **Web search** (Settings toggle): OpenRouter's `web` plugin grounds any model with fresh
   results (~$0.007/search + tokens, citations arrive as links). For OpenCode Go, Recast
   queries [Tavily](https://tavily.com) itself (free tier) and injects the top 5 results as
-  context — works with every Go model, citations arrive as markdown links.
+  context — works with every Go model, citations arrive as markdown links. Pages linked
+  in your message are fetched automatically the same way (up to 3 per message, no toggle
+  needed) — "sumiraj ovo: https://…" just works.
 
 ### Dynamic context
 
@@ -130,6 +132,8 @@ Muse Spark) — and sends the `x-opencode-session` header Go asks for. Extra ids
 **Custom models** while the Go provider is active. Web search for Go runs through Tavily:
 turn on **Search the web before answering** and set the Tavily key — Recast searches first
 (shows "Searching the web…"), then streams the answer grounded in the top 5 results.
+Linked pages are fetched too (shows "Fetching page…"): up to 3 URLs per message, detected
+automatically, capped at ~6000 characters each.
 
 The effort picker maps to OpenRouter's `reasoning.effort` and is sent only when it isn't *Default*
 and the model supports reasoning; it's hidden for models that don't. Model and effort persist to
